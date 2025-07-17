@@ -40,6 +40,8 @@
 #include <xcb/xcb_aux.h>
 #include <xcb/randr.h>
 
+#include <math.h>
+
 #include "i3lock.h"
 #include "xcb.h"
 #include "cursors.h"
@@ -95,6 +97,7 @@ static int randr_base = -1;
 
 cairo_surface_t *img = NULL;
 bool tile = false;
+bool scale = false;
 bool ignore_empty_password = false;
 bool skip_repeated_empty_password = false;
 
@@ -1005,6 +1008,80 @@ static void raise_loop(xcb_window_t window) {
     }
 }
 
+uint32_t get_rgb_interpolation(
+    float d0,
+    float d1,
+    uint32_t sample_pixel0,
+    uint32_t sample_pixel1
+) {
+    uint8_t r0 = (sample_pixel0 >> 16) & 0xFF;
+    uint8_t g0 = (sample_pixel0 >> 8) & 0xFF;
+    uint8_t b0 = (sample_pixel0 >> 0) & 0xFF;
+
+    uint8_t r1 = (sample_pixel1 >> 16) & 0xFF;
+    uint8_t g1 = (sample_pixel1 >> 8) & 0xFF;
+    uint8_t b1 = (sample_pixel1 >> 0) & 0xFF;
+
+    uint8_t r = (r0 * d0) + (r1 * d1);
+    uint8_t g = (g0 * d0) + (g1 * d1);
+    uint8_t b = (b0 * d0) + (b1 * d1);
+
+    return (255 << 24) | (r << 16) | (g << 8) | (b << 0);
+}
+
+void scale_image() {
+    unsigned char *src_buff = cairo_image_surface_get_data(img);
+    int src_stride = cairo_image_surface_get_stride(img);
+    int src_width = cairo_image_surface_get_width(img);
+    int src_height = cairo_image_surface_get_height(img);
+
+    float width_scale_factor = (float)xr_resolutions->width / src_width;
+    float height_scale_factor = (float)xr_resolutions->height / src_height;
+
+    cairo_surface_t *tmp = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, xr_resolutions->width, xr_resolutions->height);
+    unsigned char *tmp_buff = cairo_image_surface_get_data(tmp);
+    int tmp_stride = cairo_image_surface_get_stride(tmp);
+
+    for (int y = 0; y < xr_resolutions->height; y++) {
+        uint32_t *tmprow = (uint32_t*)(tmp_buff + y * tmp_stride);
+        for (int x = 0; x < xr_resolutions->width; x++) {
+            float src_x = x / width_scale_factor;
+            float src_y = y / height_scale_factor;
+
+            int x0 = floorf(src_x);
+            int x1 = x0 + 1; // TODO
+
+            int y0 = floorf(src_y);
+            int y1 = y0 + 1; // TODO
+
+            float dx0 = src_x - x0;
+            float dx1 = x1 - src_x;
+
+            float dy0 = src_y - y0;
+            float dy1 = y1 - src_y;
+
+            uint32_t *src_row0 = (uint32_t*)(src_buff + y0 * src_stride);
+            uint32_t *src_row1 = (uint32_t*)(src_buff + y1 * src_stride);
+
+            uint32_t pixel_top_left = src_row0[x0];
+            uint32_t pixel_top_right = src_row0[x1];
+            uint32_t pixel_bottom_left = src_row1[x0];
+            uint32_t pixel_bottom_right = src_row1[x1];
+
+            uint32_t top_interpolation = get_rgb_interpolation(dx0, dx1, pixel_top_left, pixel_top_right);
+            uint32_t bottom_interpolation = get_rgb_interpolation(dx0, dx1, pixel_bottom_left, pixel_bottom_right);
+            uint32_t final_interpolation = get_rgb_interpolation(dy0, dy1, top_interpolation, bottom_interpolation);
+
+            tmprow[x] = final_interpolation;
+        }
+    }
+
+    cairo_surface_destroy(img);
+
+    img = tmp;
+    cairo_surface_mark_dirty(img);
+}
+
 int main(int argc, char *argv[]) {
     struct passwd *pw;
     char *username;
@@ -1030,6 +1107,7 @@ int main(int argc, char *argv[]) {
         {"image", required_argument, NULL, 'i'},
         {"raw", required_argument, NULL, 0},
         {"tiling", no_argument, NULL, 't'},
+        {"scale", no_argument, NULL, 's'},
         {"ignore-empty-password", no_argument, NULL, 'e'},
         {"inactivity-timeout", required_argument, NULL, 'I'},
         {"show-failed-attempts", no_argument, NULL, 'f'},
@@ -1037,7 +1115,7 @@ int main(int argc, char *argv[]) {
         {NULL, no_argument, NULL, 0}};
 
     int code = EXIT_FAILURE;
-    char *optstring = "hvnbdc:p:ui:teI:fk";
+    char *optstring = "hvnbdc:p:ui:tseI:fk";
     while ((o = getopt_long(argc, argv, optstring, longopts, &longoptind)) != -1) {
         switch (o) {
             case 'v':
@@ -1077,6 +1155,9 @@ int main(int argc, char *argv[]) {
                 break;
             case 't':
                 tile = true;
+                break;
+            case 's':
+                scale = true;
                 break;
             case 'p':
                 if (!strcmp(optarg, "win")) {
@@ -1240,6 +1321,10 @@ int main(int argc, char *argv[]) {
                     image_path, cairo_status_to_string(cairo_surface_status(img)));
             img = NULL;
         }
+    }
+
+    if (scale) {
+        scale_image();
     }
 
     free(image_path);
